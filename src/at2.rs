@@ -2,17 +2,19 @@ use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Sample, SampleFormat, Stream};
 use eframe::egui;
-use egui_plot as plot;
-use midir::{Ignore, MidiInput};
-use std::sync::{Arc, RwLock};
-use std::thread;
-use std::path::PathBuf;
+use egui_plot::{Plot, PlotPoints, Line};
 use std::collections::VecDeque;
+use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
 use hound; // For WAV file loading
 use rfd::FileDialog; // For file dialogs
-use egui_plot::{Plot, PlotPoints, Line};
 use std::f32::consts::PI;
+use serde::{Serialize, Deserialize};
+use std::fs::{self, File};
+use std::io::Write;
+use serde_json;
+use dirs;
 
 // Constants
 const SAMPLE_BUFFER_SIZE: usize = 1024;
@@ -20,7 +22,7 @@ const WAVEFORM_DISPLAY_POINTS: usize = 200;
 const MAX_CUSTOM_WAVETABLES: usize = 8;
 
 // Types of waveforms
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 enum Waveform {
     Sine,
     Square,
@@ -65,18 +67,83 @@ struct Analyzer {
     last_update: Instant,
 }
 
+// Expand the Oscillator struct with additional parameters
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Oscillator {
+    waveform: Waveform,
+    volume: f32,
+    detune: f32,       // Detune in semitones
+    octave: i8,        // Octave shift (-4 to +4)
+    
+    // Per-oscillator envelope
+    attack: f32,
+    decay: f32,
+    sustain: f32,
+    release: f32,
+    
+    // Per-oscillator filter
+    filter_type: FilterType,
+    filter_cutoff: f32,  // 0.0 to 1.0 (normalized frequency)
+    filter_resonance: f32, // 0.0 to 1.0
+    
+    // Modulation
+    mod_amount: f32,    // 0.0 to 1.0
+    mod_target: ModulationTarget,
+}
+
+// Define filter types
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+enum FilterType {
+    None,
+    LowPass,
+    HighPass,
+    BandPass,
+}
+
+// Define modulation targets
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+enum ModulationTarget {
+    None,
+    Pitch,
+    FilterCutoff,
+    Volume,
+    PulseWidth,
+}
+
+// Add this enum to define different ways to combine oscillators
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+enum OscillatorCombinationMode {
+    Parallel,   // Simple addition of all oscillators
+    FM,         // Frequency modulation (osc1 modulates osc2, which modulates osc3)
+    AM,         // Amplitude modulation
+    RingMod,    // Ring modulation
+    Filter,     // First oscillator filtered by others
+}
+
 // Main synthesizer state
 struct Synth {
     sample_rate: f32,
     volume: f32,
     active_notes: Vec<Note>,
-    waveform: Waveform,
+    oscillators: [Oscillator; 3], // Three oscillators
+    oscillator_combination_mode: OscillatorCombinationMode,
+    
+    // Master envelope
     attack: f32,
     decay: f32,
     sustain: f32,
     release: f32,
+    
+    // Master filter
+    master_filter_type: FilterType,
+    master_filter_cutoff: f32,
+    master_filter_resonance: f32,
+    
     custom_wavetables: Vec<CustomWavetable>,
     analyzer: Analyzer,
+    
+    // Filter state variables (for each oscillator and master)
+    filter_states: [[f32; 4]; 4], // 3 oscillators + 1 master, 4 states per filter
 }
 
 impl Synth {
@@ -85,17 +152,68 @@ impl Synth {
             sample_rate,
             volume: 0.5,
             active_notes: Vec::new(),
-            waveform: Waveform::Sine,
+            oscillators: [
+                Oscillator {
+                    waveform: Waveform::Sine,
+                    volume: 0.5,
+                    detune: 0.0,
+                    octave: 0,
+                    attack: 0.1,
+                    decay: 0.2,
+                    sustain: 0.7,
+                    release: 0.3,
+                    filter_type: FilterType::None,
+                    filter_cutoff: 1.0,
+                    filter_resonance: 0.0,
+                    mod_amount: 0.0,
+                    mod_target: ModulationTarget::None,
+                },
+                Oscillator {
+                    waveform: Waveform::Sine,
+                    volume: 0.0,
+                    detune: 0.0,
+                    octave: 0,
+                    attack: 0.1,
+                    decay: 0.2,
+                    sustain: 0.7,
+                    release: 0.3,
+                    filter_type: FilterType::None,
+                    filter_cutoff: 1.0,
+                    filter_resonance: 0.0,
+                    mod_amount: 0.0,
+                    mod_target: ModulationTarget::None,
+                },
+                Oscillator {
+                    waveform: Waveform::Sine,
+                    volume: 0.0,
+                    detune: 0.0,
+                    octave: 0,
+                    attack: 0.1,
+                    decay: 0.2,
+                    sustain: 0.7,
+                    release: 0.3,
+                    filter_type: FilterType::None,
+                    filter_cutoff: 1.0,
+                    filter_resonance: 0.0,
+                    mod_amount: 0.0,
+                    mod_target: ModulationTarget::None,
+                },
+            ],
+            oscillator_combination_mode: OscillatorCombinationMode::Parallel,
             attack: 0.1,
             decay: 0.2,
             sustain: 0.7,
             release: 0.3,
+            master_filter_type: FilterType::None,
+            master_filter_cutoff: 1.0,
+            master_filter_resonance: 0.0,
             custom_wavetables: Vec::new(),
             analyzer: Analyzer {
                 current_waveform_samples: VecDeque::with_capacity(SAMPLE_BUFFER_SIZE),
                 fft_buffer: vec![0.0; SAMPLE_BUFFER_SIZE],
                 last_update: Instant::now(),
             },
+            filter_states: [[0.0; 4]; 4],
         }
     }
 
@@ -172,19 +290,72 @@ impl Synth {
         Ok(())
     }
 
-    fn get_sample(&mut self, _sample_time: f32) -> f32 {
-        let mut sample = 0.0;
-        let mut notes_to_remove = Vec::new();
+    // Fix the apply_filter method to avoid mutable borrow issues
+    fn apply_filter(&self, sample: f32, filter_type: &FilterType, cutoff: f32, resonance: f32, _filter_index: usize) -> f32 {
+        // Skip processing if no filter is selected
+        if *filter_type == FilterType::None {
+            return sample;
+        }
+        
+        // Normalize cutoff to 0.0-1.0 range
+        let cutoff = cutoff.clamp(0.01, 0.99);
+        
+        // Convert resonance to Q factor (0.7 to 20.0)
+        let q = 0.7 + resonance * 19.3;
+        
+        // Calculate filter coefficients (simplified biquad filter)
+        let omega = 2.0 * std::f32::consts::PI * cutoff / self.sample_rate;
+        let sin_omega = omega.sin();
+        let _cos_omega = omega.cos();
+        let _alpha = sin_omega / (2.0 * q);
+        
+        // Since we can't modify filter states here, we'll use a simplified approach
+        // This is a non-stateful approximation of the filter
+        match filter_type {
+            FilterType::LowPass => {
+                // Simple lowpass approximation
+                let cutoff_factor = cutoff.powf(0.5);
+                sample * cutoff_factor
+            },
+            FilterType::HighPass => {
+                // Simple highpass approximation
+                let cutoff_factor = 1.0 - cutoff.powf(0.5);
+                sample * cutoff_factor
+            },
+            FilterType::BandPass => {
+                // Simple bandpass approximation
+                let band_factor = 1.0 - (cutoff - 0.5).abs() * 2.0;
+                sample * band_factor
+            },
+            FilterType::None => sample,
+        }
+    }
 
+    // Fix the get_sample method to avoid multiple mutable borrows
+    fn get_sample(&mut self, _sample_time: f32) -> f32 {
+        // Process all active notes and collect their outputs
+        let mut note_outputs = Vec::with_capacity(self.active_notes.len());
+        let mut notes_to_remove = Vec::new();
+        
+        // Store oscillator data to avoid multiple borrows
+        let oscillators = self.oscillators.clone();
+        let osc_combination_mode = self.oscillator_combination_mode.clone();
+        let sample_rate = self.sample_rate;
+        let attack = self.attack;
+        let decay = self.decay;
+        let sustain = self.sustain;
+        let release = self.release;
+        
+        // First pass: process all notes and collect their data
         for (i, note) in self.active_notes.iter_mut().enumerate() {
             // Update phase for this note
             note.phase = (note.phase + note.phase_increment) % 1.0;
             
-            // Calculate envelope
-            let envelope = match note.state {
+            // Calculate master envelope
+            let master_envelope = match note.state {
                 NoteState::Attack => {
-                    note.time_in_state += 1.0 / self.sample_rate;
-                    let value = note.time_in_state / self.attack;
+                    note.time_in_state += 1.0 / sample_rate;
+                    let value = note.time_in_state / attack;
                     if value >= 1.0 {
                         note.state = NoteState::Decay;
                         note.time_in_state = 0.0;
@@ -194,21 +365,21 @@ impl Synth {
                     }
                 },
                 NoteState::Decay => {
-                    note.time_in_state += 1.0 / self.sample_rate;
-                    let value = 1.0 - (1.0 - self.sustain) * (note.time_in_state / self.decay);
-                    if value <= self.sustain || note.time_in_state >= self.decay {
+                    note.time_in_state += 1.0 / sample_rate;
+                    let value = 1.0 - (1.0 - sustain) * (note.time_in_state / decay);
+                    if value <= sustain || note.time_in_state >= decay {
                         note.state = NoteState::Sustain;
                         note.time_in_state = 0.0;
-                        self.sustain
+                        sustain
                     } else {
                         value
                     }
                 },
-                NoteState::Sustain => self.sustain,
+                NoteState::Sustain => sustain,
                 NoteState::Release => {
-                    note.time_in_state += 1.0 / self.sample_rate;
-                    let value = self.sustain * (1.0 - note.time_in_state / self.release);
-                    if value <= 0.0 || note.time_in_state >= self.release {
+                    note.time_in_state += 1.0 / sample_rate;
+                    let value = sustain * (1.0 - note.time_in_state / release);
+                    if value <= 0.0 || note.time_in_state >= release {
                         notes_to_remove.push(i);
                         0.0
                     } else {
@@ -217,39 +388,199 @@ impl Synth {
                 },
             };
             
-            // Get waveform value based on the current waveform type
-            let waveform_value = match &self.waveform {
-                Waveform::Sine => (2.0 * std::f32::consts::PI * note.phase).sin(),
-                Waveform::Square => if note.phase < 0.5 { 1.0 } else { -1.0 },
-                Waveform::Saw => 2.0 * note.phase - 1.0,
-                Waveform::Triangle => {
-                    if note.phase < 0.25 {
-                        4.0 * note.phase
-                    } else if note.phase < 0.75 {
-                        2.0 - 4.0 * note.phase
-                    } else {
-                        -4.0 + 4.0 * note.phase
-                    }
-                },
-                Waveform::WhiteNoise => rand::random::<f32>() * 2.0 - 1.0,
-                Waveform::CustomSample(index) => {
-                    if let Some(wavetable) = self.custom_wavetables.get(*index) {
-                        // Sample from the wavetable
-                        let position = note.phase * wavetable.samples.len() as f32;
-                        let index = position.floor() as usize % wavetable.samples.len();
-                        let next_index = (index + 1) % wavetable.samples.len();
-                        let fraction = position - position.floor();
-                        
-                        // Linear interpolation between samples
-                        wavetable.samples[index] * (1.0 - fraction) + 
-                        wavetable.samples[next_index] * fraction
-                    } else {
-                        0.0
-                    }
+            // Process each oscillator for this note
+            let mut osc_outputs = [0.0; 3];
+            
+            for (osc_idx, oscillator) in oscillators.iter().enumerate() {
+                if oscillator.volume > 0.0 {
+                    // Apply octave shift and detune to the frequency
+                    let octave_factor = 2.0f32.powf(oscillator.octave as f32);
+                    let detune_factor = 2.0f32.powf(oscillator.detune / 12.0);
+                    let frequency_factor = octave_factor * detune_factor;
+                    
+                    // Calculate modulated phase
+                    let mod_phase = match oscillator.mod_target {
+                        ModulationTarget::Pitch => {
+                            // Apply pitch modulation (simple LFO)
+                            let lfo = (_sample_time * 5.0).sin() * oscillator.mod_amount;
+                            (note.phase * frequency_factor * (1.0 + lfo)) % 1.0
+                        },
+                        _ => (note.phase * frequency_factor) % 1.0
+                    };
+                    
+                    // Get waveform value based on the oscillator's waveform type
+                    let waveform_value = match &oscillator.waveform {
+                        Waveform::Sine => (2.0 * std::f32::consts::PI * mod_phase).sin(),
+                        Waveform::Square => {
+                            // Apply pulse width modulation if selected
+                            let pulse_width = match oscillator.mod_target {
+                                ModulationTarget::PulseWidth => {
+                                    // Modulate pulse width between 0.1 and 0.9
+                                    let lfo = (_sample_time * 3.0).sin() * oscillator.mod_amount;
+                                    0.5 + lfo * 0.4
+                                },
+                                _ => 0.5
+                            };
+                            if mod_phase < pulse_width { 1.0 } else { -1.0 }
+                        },
+                        Waveform::Saw => 2.0 * mod_phase - 1.0,
+                        Waveform::Triangle => {
+                            if mod_phase < 0.25 {
+                                4.0 * mod_phase
+                            } else if mod_phase < 0.75 {
+                                2.0 - 4.0 * mod_phase
+                            } else {
+                                -4.0 + 4.0 * mod_phase
+                            }
+                        },
+                        Waveform::WhiteNoise => rand::random::<f32>() * 2.0 - 1.0,
+                        Waveform::CustomSample(index) => {
+                            if let Some(wavetable) = self.custom_wavetables.get(*index) {
+                                // Sample from the wavetable
+                                let position = mod_phase * wavetable.samples.len() as f32;
+                                let index = position.floor() as usize % wavetable.samples.len();
+                                let next_index = (index + 1) % wavetable.samples.len();
+                                let fraction = position - position.floor();
+                                
+                                // Linear interpolation between samples
+                                wavetable.samples[index] * (1.0 - fraction) + 
+                                wavetable.samples[next_index] * fraction
+                            } else {
+                                0.0
+                            }
+                        }
+                    };
+                    
+                    // Apply oscillator-specific envelope
+                    let osc_envelope = match note.state {
+                        NoteState::Attack => {
+                            let value = note.time_in_state / oscillator.attack;
+                            if value >= 1.0 { 1.0 } else { value }
+                        },
+                        NoteState::Decay => {
+                            1.0 - (1.0 - oscillator.sustain) * (note.time_in_state / oscillator.decay)
+                        },
+                        NoteState::Sustain => oscillator.sustain,
+                        NoteState::Release => {
+                            oscillator.sustain * (1.0 - note.time_in_state / oscillator.release)
+                        },
+                    };
+                    
+                    // Apply volume modulation if selected
+                    let volume_mod = match oscillator.mod_target {
+                        ModulationTarget::Volume => {
+                            // Tremolo effect
+                            1.0 + (_sample_time * 6.0).sin() * oscillator.mod_amount
+                        },
+                        _ => 1.0
+                    };
+                    
+                    // Apply filter modulation if selected
+                    let filter_cutoff_mod = match oscillator.mod_target {
+                        ModulationTarget::FilterCutoff => {
+                            // Filter cutoff modulation
+                            oscillator.filter_cutoff * (1.0 + (_sample_time * 4.0).sin() * oscillator.mod_amount)
+                        },
+                        _ => oscillator.filter_cutoff
+                    };
+                    
+                    // Apply oscillator's filter (simplified version without state)
+                    let filtered_sample = match oscillator.filter_type {
+                        FilterType::LowPass => {
+                            let cutoff = filter_cutoff_mod.clamp(0.01, 0.99);
+                            waveform_value * cutoff.powf(0.5)
+                        },
+                        FilterType::HighPass => {
+                            let cutoff = filter_cutoff_mod.clamp(0.01, 0.99);
+                            waveform_value * (1.0 - cutoff.powf(0.5))
+                        },
+                        FilterType::BandPass => {
+                            let cutoff = filter_cutoff_mod.clamp(0.01, 0.99);
+                            let band_factor = 1.0 - (cutoff - 0.5).abs() * 2.0;
+                            waveform_value * band_factor
+                        },
+                        FilterType::None => waveform_value,
+                    };
+                    
+                    osc_outputs[osc_idx] = filtered_sample * oscillator.volume * volume_mod * osc_envelope;
                 }
+            }
+            
+            // Combine oscillator outputs based on the selected mode
+            let osc_sample = match osc_combination_mode {
+                OscillatorCombinationMode::Parallel => {
+                    // Simple addition of all oscillators
+                    osc_outputs[0] + osc_outputs[1] + osc_outputs[2]
+                },
+                OscillatorCombinationMode::FM => {
+                    // Simplified FM approach
+                    let mod_depth = 0.5;
+                    
+                    // Apply osc3 to modulate osc2
+                    let mod_phase2 = (note.phase + osc_outputs[2] * mod_depth) % 1.0;
+                    let osc2_mod = match &oscillators[1].waveform {
+                        Waveform::Sine => (2.0 * std::f32::consts::PI * mod_phase2).sin(),
+                        Waveform::Square => if mod_phase2 < 0.5 { 1.0 } else { -1.0 },
+                        Waveform::Saw => 2.0 * mod_phase2 - 1.0,
+                        Waveform::Triangle => {
+                            if mod_phase2 < 0.25 {
+                                4.0 * mod_phase2
+                            } else if mod_phase2 < 0.75 {
+                                2.0 - 4.0 * mod_phase2
+                            } else {
+                                -4.0 + 4.0 * mod_phase2
+                            }
+                        },
+                        _ => osc_outputs[1],
+                    } * oscillators[1].volume;
+                    
+                    // Apply osc2 to modulate osc1
+                    let mod_phase1 = (note.phase + osc2_mod * mod_depth) % 1.0;
+                    let osc1_mod = match &oscillators[0].waveform {
+                        Waveform::Sine => (2.0 * std::f32::consts::PI * mod_phase1).sin(),
+                        Waveform::Square => if mod_phase1 < 0.5 { 1.0 } else { -1.0 },
+                        Waveform::Saw => 2.0 * mod_phase1 - 1.0,
+                        Waveform::Triangle => {
+                            if mod_phase1 < 0.25 {
+                                4.0 * mod_phase1
+                            } else if mod_phase1 < 0.75 {
+                                2.0 - 4.0 * mod_phase1
+                            } else {
+                                -4.0 + 4.0 * mod_phase1
+                            }
+                        },
+                        _ => osc_outputs[0],
+                    } * oscillators[0].volume;
+                    
+                    osc1_mod
+                },
+                OscillatorCombinationMode::AM => {
+                    // Amplitude modulation
+                    let carrier = osc_outputs[0];
+                    let modulator = (1.0 + osc_outputs[1]) * (1.0 + osc_outputs[2]);
+                    carrier * modulator * 0.5
+                },
+                OscillatorCombinationMode::RingMod => {
+                    // Ring modulation
+                    osc_outputs[0] * osc_outputs[1] * osc_outputs[2]
+                },
+                OscillatorCombinationMode::Filter => {
+                    // Simple filter effect
+                    let source = osc_outputs[0];
+                    let filter_amount = (osc_outputs[1] + 1.0) * 0.5;
+                    let resonance = (osc_outputs[2] + 1.0) * 0.5;
+                    
+                    source * (1.0 - filter_amount) + source.tanh() * filter_amount * (1.0 + resonance)
+                },
             };
             
-            sample += waveform_value * envelope * note.velocity;
+            note_outputs.push(osc_sample * master_envelope * note.velocity);
+        }
+        
+        // Sum all note outputs
+        let mut sample = 0.0;
+        for output in note_outputs {
+            sample += output;
         }
         
         // Remove finished notes
@@ -257,8 +588,17 @@ impl Synth {
             self.active_notes.remove(*i);
         }
         
+        // Apply master filter
+        let filtered_sample = self.apply_filter(
+            sample,
+            &self.master_filter_type,
+            self.master_filter_cutoff,
+            self.master_filter_resonance,
+            3 // Use index 3 for master filter
+        );
+        
         // Apply master volume
-        let final_sample = sample * self.volume;
+        let final_sample = filtered_sample * self.volume;
         
         // Update our analyzer with this sample
         if self.analyzer.current_waveform_samples.len() >= SAMPLE_BUFFER_SIZE {
@@ -301,33 +641,107 @@ impl Synth {
         for i in 0..WAVEFORM_DISPLAY_POINTS {
             let phase = i as f32 / WAVEFORM_DISPLAY_POINTS as f32;
             
-            let value = match &self.waveform {
-                Waveform::Sine => (2.0 * std::f32::consts::PI * phase).sin(),
-                Waveform::Square => if phase < 0.5 { 1.0 } else { -1.0 },
-                Waveform::Saw => 2.0 * phase - 1.0,
-                Waveform::Triangle => {
-                    if phase < 0.25 {
-                        4.0 * phase
-                    } else if phase < 0.75 {
-                        2.0 - 4.0 * phase
-                    } else {
-                        -4.0 + 4.0 * phase
-                    }
-                },
-                Waveform::WhiteNoise => {
-                    // For noise, we'll use a pre-calculated random set for visualization
-                    let seed = i as f32 / 10.0;
-                    (seed.sin() * 12.5).sin()
-                },
-                Waveform::CustomSample(index) => {
-                    if let Some(wavetable) = self.custom_wavetables.get(*index) {
-                        let sample_pos = phase * wavetable.samples.len() as f32;
-                        let index = sample_pos.floor() as usize % wavetable.samples.len();
-                        wavetable.samples[index]
-                    } else {
-                        0.0
-                    }
+            // Get samples from each oscillator
+            let mut osc_samples = [0.0; 3];
+            
+            for (i, oscillator) in self.oscillators.iter().enumerate() {
+                if oscillator.volume > 0.0 {
+                    // Apply detune to the phase
+                    let detuned_phase = (phase * 2.0f32.powf(oscillator.detune / 12.0)) % 1.0;
+                    
+                    let osc_value = match &oscillator.waveform {
+                        Waveform::Sine => (2.0 * std::f32::consts::PI * detuned_phase).sin(),
+                        Waveform::Square => if detuned_phase < 0.5 { 1.0 } else { -1.0 },
+                        Waveform::Saw => 2.0 * detuned_phase - 1.0,
+                        Waveform::Triangle => {
+                            if detuned_phase < 0.25 {
+                                4.0 * detuned_phase
+                            } else if detuned_phase < 0.75 {
+                                2.0 - 4.0 * detuned_phase
+                            } else {
+                                -4.0 + 4.0 * detuned_phase
+                            }
+                        },
+                        Waveform::WhiteNoise => {
+                            // For noise, we'll use a pre-calculated random set for visualization
+                            let seed = i as f32 / 10.0;
+                            (seed.sin() * 12.5).sin()
+                        },
+                        Waveform::CustomSample(index) => {
+                            if let Some(wavetable) = self.custom_wavetables.get(*index) {
+                                let sample_pos = detuned_phase * wavetable.samples.len() as f32;
+                                let index = sample_pos.floor() as usize % wavetable.samples.len();
+                                wavetable.samples[index]
+                            } else {
+                                0.0
+                            }
+                        }
+                    };
+                    
+                    osc_samples[i] = osc_value * oscillator.volume;
                 }
+            }
+            
+            // Combine oscillator outputs based on the selected mode
+            let value = match self.oscillator_combination_mode {
+                OscillatorCombinationMode::Parallel => {
+                    osc_samples[0] + osc_samples[1] + osc_samples[2]
+                },
+                OscillatorCombinationMode::FM => {
+                    // Simplified FM for visualization
+                    let mod_depth = 0.5;
+                    
+                    let mod_phase2 = (phase + osc_samples[2] * mod_depth) % 1.0;
+                    let osc2_mod = match &self.oscillators[1].waveform {
+                        Waveform::Sine => (2.0 * std::f32::consts::PI * mod_phase2).sin(),
+                        Waveform::Square => if mod_phase2 < 0.5 { 1.0 } else { -1.0 },
+                        Waveform::Saw => 2.0 * mod_phase2 - 1.0,
+                        Waveform::Triangle => {
+                            if mod_phase2 < 0.25 {
+                                4.0 * mod_phase2
+                            } else if mod_phase2 < 0.75 {
+                                2.0 - 4.0 * mod_phase2
+                            } else {
+                                -4.0 + 4.0 * mod_phase2
+                            }
+                        },
+                        _ => osc_samples[1],
+                    } * self.oscillators[1].volume;
+                    
+                    let mod_phase1 = (phase + osc2_mod * mod_depth) % 1.0;
+                    let osc1_mod = match &self.oscillators[0].waveform {
+                        Waveform::Sine => (2.0 * std::f32::consts::PI * mod_phase1).sin(),
+                        Waveform::Square => if mod_phase1 < 0.5 { 1.0 } else { -1.0 },
+                        Waveform::Saw => 2.0 * mod_phase1 - 1.0,
+                        Waveform::Triangle => {
+                            if mod_phase1 < 0.25 {
+                                4.0 * mod_phase1
+                            } else if mod_phase1 < 0.75 {
+                                2.0 - 4.0 * mod_phase1
+                            } else {
+                                -4.0 + 4.0 * mod_phase1
+                            }
+                        },
+                        _ => osc_samples[0],
+                    } * self.oscillators[0].volume;
+                    
+                    osc1_mod
+                },
+                OscillatorCombinationMode::AM => {
+                    let carrier = osc_samples[0];
+                    let modulator = (1.0 + osc_samples[1]) * (1.0 + osc_samples[2]);
+                    carrier * modulator * 0.5
+                },
+                OscillatorCombinationMode::RingMod => {
+                    osc_samples[0] * osc_samples[1] * osc_samples[2]
+                },
+                OscillatorCombinationMode::Filter => {
+                    let source = osc_samples[0];
+                    let filter_amount = (osc_samples[1] + 1.0) * 0.5;
+                    let resonance = (osc_samples[2] + 1.0) * 0.5;
+                    
+                    source * (1.0 - filter_amount) + source.tanh() * filter_amount * (1.0 + resonance)
+                },
             };
             
             points.push([phase, value]);
@@ -354,7 +768,7 @@ impl Synth {
                 let phase = i as f32 / SAMPLES_PER_CYCLE as f32;
                 
                 // Get the waveform value based on the current waveform type
-                let value = match &self.waveform {
+                let value = match &self.oscillators[0].waveform {
                     Waveform::Sine => (2.0 * PI * phase).sin(),
                     Waveform::Square => if phase < 0.5 { 1.0 } else { -1.0 },
                     Waveform::Saw => 2.0 * phase - 1.0,
@@ -407,6 +821,37 @@ impl Synth {
         
         pitch_lines
     }
+
+    // Add a method to create a preset from current settings
+    fn create_preset(&self, name: String) -> SynthPreset {
+        SynthPreset {
+            name,
+            oscillators: self.oscillators.clone(),
+            oscillator_combination_mode: self.oscillator_combination_mode.clone(),
+            attack: self.attack,
+            decay: self.decay,
+            sustain: self.sustain,
+            release: self.release,
+            master_filter_type: self.master_filter_type.clone(),
+            master_filter_cutoff: self.master_filter_cutoff,
+            master_filter_resonance: self.master_filter_resonance,
+            volume: self.volume,
+        }
+    }
+    
+    // Add a method to apply a preset
+    fn apply_preset(&mut self, preset: &SynthPreset) {
+        self.oscillators = preset.oscillators.clone();
+        self.oscillator_combination_mode = preset.oscillator_combination_mode.clone();
+        self.attack = preset.attack;
+        self.decay = preset.decay;
+        self.sustain = preset.sustain;
+        self.release = preset.release;
+        self.master_filter_type = preset.master_filter_type.clone();
+        self.master_filter_cutoff = preset.master_filter_cutoff;
+        self.master_filter_resonance = preset.master_filter_resonance;
+        self.volume = preset.volume;
+    }
 }
 
 fn midi_note_to_freq(note: u8) -> f32 {
@@ -420,12 +865,14 @@ fn midi_note_to_freq(note: u8) -> f32 {
 enum SynthMessage {
     NoteOn(u8, u8),
     NoteOff(u8),
-    ChangeWaveform(Waveform),
+    ChangeOscillator(usize, Waveform, f32, f32, i8), // (osc_index, waveform, volume, detune, octave)
+    ChangeOscillatorEnvelope(usize, f32, f32, f32, f32), // (osc_index, attack, decay, sustain, release)
+    ChangeOscillatorFilter(usize, FilterType, f32, f32), // (osc_index, filter_type, cutoff, resonance)
+    ChangeOscillatorModulation(usize, f32, ModulationTarget), // (osc_index, amount, target)
+    ChangeOscillatorCombinationMode(OscillatorCombinationMode),
+    ChangeMasterEnvelope(f32, f32, f32, f32), // (attack, decay, sustain, release)
+    ChangeMasterFilter(FilterType, f32, f32), // (filter_type, cutoff, resonance)
     ChangeVolume(f32),
-    ChangeAttack(f32),
-    ChangeDecay(f32),
-    ChangeSustain(f32),
-    ChangeRelease(f32),
     LoadSample(PathBuf),
     SetVolume(f32),
     SetModulation(f32),
@@ -451,6 +898,9 @@ pub struct SynthApp {
     selected_input_device_idx: usize,
     current_tab: Tab,
     last_midi_message: Option<String>,
+    presets: Vec<SynthPreset>,
+    current_preset_name: String,
+    app_settings: AppSettings,
 }
 
 impl eframe::App for SynthApp {
@@ -572,6 +1022,15 @@ impl SynthApp {
             selected_output_device_idx: 0,
             selected_input_device_idx: 0,
             show_sample_dialog: false,
+            presets: Vec::new(),
+            current_preset_name: String::new(),
+            app_settings: AppSettings {
+                selected_midi_port: None,
+                selected_output_device: None,
+                selected_input_device: None,
+                volume: 0.5,
+                last_preset: None,
+            },
         })
     }
     
@@ -592,9 +1051,61 @@ impl SynthApp {
                         synth.note_off(note);
                     }
                 },
-                SynthMessage::ChangeWaveform(waveform) => {
+                SynthMessage::ChangeOscillator(index, waveform, volume, detune, octave) => {
                     if let Ok(mut synth) = self.synth.write() {
-                        synth.waveform = waveform;
+                        if index < synth.oscillators.len() {
+                            synth.oscillators[index].waveform = waveform;
+                            synth.oscillators[index].volume = volume;
+                            synth.oscillators[index].detune = detune;
+                            synth.oscillators[index].octave = octave;
+                        }
+                    }
+                },
+                SynthMessage::ChangeOscillatorEnvelope(index, attack, decay, sustain, release) => {
+                    if let Ok(mut synth) = self.synth.write() {
+                        if index < synth.oscillators.len() {
+                            synth.oscillators[index].attack = attack;
+                            synth.oscillators[index].decay = decay;
+                            synth.oscillators[index].sustain = sustain;
+                            synth.oscillators[index].release = release;
+                        }
+                    }
+                },
+                SynthMessage::ChangeOscillatorFilter(index, filter_type, cutoff, resonance) => {
+                    if let Ok(mut synth) = self.synth.write() {
+                        if index < synth.oscillators.len() {
+                            synth.oscillators[index].filter_type = filter_type;
+                            synth.oscillators[index].filter_cutoff = cutoff;
+                            synth.oscillators[index].filter_resonance = resonance;
+                        }
+                    }
+                },
+                SynthMessage::ChangeOscillatorModulation(index, amount, target) => {
+                    if let Ok(mut synth) = self.synth.write() {
+                        if index < synth.oscillators.len() {
+                            synth.oscillators[index].mod_amount = amount;
+                            synth.oscillators[index].mod_target = target;
+                        }
+                    }
+                },
+                SynthMessage::ChangeOscillatorCombinationMode(mode) => {
+                    if let Ok(mut synth) = self.synth.write() {
+                        synth.oscillator_combination_mode = mode;
+                    }
+                },
+                SynthMessage::ChangeMasterEnvelope(attack, decay, sustain, release) => {
+                    if let Ok(mut synth) = self.synth.write() {
+                        synth.attack = attack;
+                        synth.decay = decay;
+                        synth.sustain = sustain;
+                        synth.release = release;
+                    }
+                },
+                SynthMessage::ChangeMasterFilter(filter_type, cutoff, resonance) => {
+                    if let Ok(mut synth) = self.synth.write() {
+                        synth.master_filter_type = filter_type;
+                        synth.master_filter_cutoff = cutoff;
+                        synth.master_filter_resonance = resonance;
                     }
                 },
                 SynthMessage::SetVolume(volume) => {
@@ -617,51 +1128,239 @@ impl SynthApp {
         // Main synthesizer controls
         ui.heading("Synthesizer");
         
-        // Waveform selection
+        let mut synth = self.synth.write().unwrap();
+        
+        // Oscillator combination mode
+        ui.heading("Oscillator Combination Mode");
         ui.horizontal(|ui| {
-            ui.label("Waveform:");
-            let mut synth = self.synth.write().unwrap();
+            let mut changed = false;
+            let mut new_mode = synth.oscillator_combination_mode.clone();
             
-            if ui.radio_value(&mut synth.waveform, Waveform::Sine, "Sine").clicked() {
-                self.sender.send(SynthMessage::ChangeWaveform(Waveform::Sine)).ok();
+            if ui.radio_value(&mut new_mode, OscillatorCombinationMode::Parallel, "Parallel").clicked() {
+                changed = true;
             }
-            if ui.radio_value(&mut synth.waveform, Waveform::Square, "Square").clicked() {
-                self.sender.send(SynthMessage::ChangeWaveform(Waveform::Square)).ok();
+            if ui.radio_value(&mut new_mode, OscillatorCombinationMode::FM, "FM").clicked() {
+                changed = true;
             }
-            if ui.radio_value(&mut synth.waveform, Waveform::Saw, "Saw").clicked() {
-                self.sender.send(SynthMessage::ChangeWaveform(Waveform::Saw)).ok();
+            if ui.radio_value(&mut new_mode, OscillatorCombinationMode::AM, "AM").clicked() {
+                changed = true;
             }
-            if ui.radio_value(&mut synth.waveform, Waveform::Triangle, "Triangle").clicked() {
-                self.sender.send(SynthMessage::ChangeWaveform(Waveform::Triangle)).ok();
+            if ui.radio_value(&mut new_mode, OscillatorCombinationMode::RingMod, "Ring Mod").clicked() {
+                changed = true;
             }
-            if ui.radio_value(&mut synth.waveform, Waveform::WhiteNoise, "Noise").clicked() {
-                self.sender.send(SynthMessage::ChangeWaveform(Waveform::WhiteNoise)).ok();
+            if ui.radio_value(&mut new_mode, OscillatorCombinationMode::Filter, "Filter").clicked() {
+                changed = true;
+            }
+            
+            if changed {
+                self.sender.send(SynthMessage::ChangeOscillatorCombinationMode(new_mode.clone())).ok();
+                synth.oscillator_combination_mode = new_mode;
             }
         });
         
+        // Oscillator controls
+        ui.heading("Oscillators");
+        
+        // First, collect the data we need from custom wavetables to avoid borrowing issues
+        let custom_wavetable_names: Vec<(usize, String)> = synth.custom_wavetables
+            .iter()
+            .enumerate()
+            .map(|(idx, wavetable)| (idx, wavetable.name.clone()))
+            .collect();
+        
+        for (i, oscillator) in synth.oscillators.iter_mut().enumerate() {
+            ui.collapsing(format!("Oscillator {}", i + 1), |ui| {
+                // Waveform selection
+                ui.horizontal(|ui| {
+                    ui.label("Waveform:");
+                    
+                    let mut changed = false;
+                    let mut new_waveform = oscillator.waveform.clone();
+                    
+                    if ui.radio_value(&mut new_waveform, Waveform::Sine, "Sine").clicked() {
+                        changed = true;
+                    }
+                    if ui.radio_value(&mut new_waveform, Waveform::Square, "Square").clicked() {
+                        changed = true;
+                    }
+                    if ui.radio_value(&mut new_waveform, Waveform::Saw, "Saw").clicked() {
+                        changed = true;
+                    }
+                    if ui.radio_value(&mut new_waveform, Waveform::Triangle, "Triangle").clicked() {
+                        changed = true;
+                    }
+                    if ui.radio_value(&mut new_waveform, Waveform::WhiteNoise, "Noise").clicked() {
+                        changed = true;
+                    }
+                    
+                    // Custom sample selection using our pre-collected data
+                    for (idx, name) in &custom_wavetable_names {
+                        if ui.radio_value(&mut new_waveform, Waveform::CustomSample(*idx), name).clicked() {
+                            changed = true;
+                        }
+                    }
+                    
+                    if changed {
+                        self.sender.send(SynthMessage::ChangeOscillator(
+                            i, new_waveform.clone(), oscillator.volume, oscillator.detune, oscillator.octave
+                        )).ok();
+                        oscillator.waveform = new_waveform;
+                    }
+                });
+                
+                // Volume control
+                ui.horizontal(|ui| {
+                    ui.label("Volume:");
+                    if ui.add(egui::Slider::new(&mut oscillator.volume, 0.0..=1.0).text("")).changed() {
+                        self.sender.send(SynthMessage::ChangeOscillator(
+                            i, oscillator.waveform.clone(), oscillator.volume, oscillator.detune, oscillator.octave
+                        )).ok();
+                    }
+                });
+                
+                // Detune control
+                ui.horizontal(|ui| {
+                    ui.label("Detune:");
+                    if ui.add(egui::Slider::new(&mut oscillator.detune, -12.0..=12.0).text("semitones")).changed() {
+                        self.sender.send(SynthMessage::ChangeOscillator(
+                            i, oscillator.waveform.clone(), oscillator.volume, oscillator.detune, oscillator.octave
+                        )).ok();
+                    }
+                });
+                
+                // Octave control
+                ui.horizontal(|ui| {
+                    ui.label("Octave:");
+                    if ui.add(egui::Slider::new(&mut oscillator.octave, -4..=4).text("")).changed() {
+                        self.sender.send(SynthMessage::ChangeOscillator(
+                            i, oscillator.waveform.clone(), oscillator.volume, oscillator.detune, oscillator.octave
+                        )).ok();
+                    }
+                });
+                
+                // Oscillator ADSR controls
+                ui.collapsing("Envelope", |ui| {
+                    let mut attack = oscillator.attack;
+                    let mut decay = oscillator.decay;
+                    let mut sustain = oscillator.sustain;
+                    let mut release = oscillator.release;
+                    
+                    ui.horizontal(|ui| {
+                        ui.label("Attack:");
+                        if ui.add(egui::Slider::new(&mut attack, 0.01..=2.0).text("s")).changed() {
+                            self.sender.send(SynthMessage::ChangeOscillatorEnvelope(
+                                i, attack, decay, sustain, release
+                            )).ok();
+                            oscillator.attack = attack;
+                        }
+                    });
+                    
+                    ui.horizontal(|ui| {
+                        ui.label("Decay:");
+                        if ui.add(egui::Slider::new(&mut decay, 0.01..=2.0).text("s")).changed() {
+                            self.sender.send(SynthMessage::ChangeOscillatorEnvelope(
+                                i, attack, decay, sustain, release
+                            )).ok();
+                            oscillator.decay = decay;
+                        }
+                    });
+                    
+                    ui.horizontal(|ui| {
+                        ui.label("Sustain:");
+                        if ui.add(egui::Slider::new(&mut sustain, 0.0..=1.0).text("")).changed() {
+                            self.sender.send(SynthMessage::ChangeOscillatorEnvelope(
+                                i, attack, decay, sustain, release
+                            )).ok();
+                            oscillator.sustain = sustain;
+                        }
+                    });
+                    
+                    ui.horizontal(|ui| {
+                        ui.label("Release:");
+                        if ui.add(egui::Slider::new(&mut release, 0.01..=5.0).text("s")).changed() {
+                            self.sender.send(SynthMessage::ChangeOscillatorEnvelope(
+                                i, attack, decay, sustain, release
+                            )).ok();
+                            oscillator.release = release;
+                        }
+                    });
+                });
+                
+                // Oscillator filter controls
+                ui.collapsing("Filter", |ui| {
+                    let mut filter_type = oscillator.filter_type.clone();
+                    let mut filter_cutoff = oscillator.filter_cutoff;
+                    let mut filter_resonance = oscillator.filter_resonance;
+                    
+                    ui.horizontal(|ui| {
+                        ui.label("Type:");
+                        let mut changed = false;
+                        
+                        if ui.radio_value(&mut filter_type, FilterType::None, "None").clicked() {
+                            changed = true;
+                        }
+                        if ui.radio_value(&mut filter_type, FilterType::LowPass, "Low Pass").clicked() {
+                            changed = true;
+                        }
+                        if ui.radio_value(&mut filter_type, FilterType::HighPass, "High Pass").clicked() {
+                            changed = true;
+                        }
+                        if ui.radio_value(&mut filter_type, FilterType::BandPass, "Band Pass").clicked() {
+                            changed = true;
+                        }
+                        
+                        if changed {
+                            self.sender.send(SynthMessage::ChangeOscillatorFilter(
+                                i, filter_type.clone(), filter_cutoff, filter_resonance
+                            )).ok();
+                            oscillator.filter_type = filter_type.clone();
+                        }
+                    });
+                    
+                    ui.horizontal(|ui| {
+                        ui.label("Cutoff:");
+                        if ui.add(egui::Slider::new(&mut filter_cutoff, 0.01..=1.0).text("")).changed() {
+                            self.sender.send(SynthMessage::ChangeOscillatorFilter(
+                                i, filter_type.clone(), filter_cutoff, filter_resonance
+                            )).ok();
+                            oscillator.filter_cutoff = filter_cutoff;
+                        }
+                    });
+                    
+                    ui.horizontal(|ui| {
+                        ui.label("Resonance:");
+                        if ui.add(egui::Slider::new(&mut filter_resonance, 0.0..=1.0).text("")).changed() {
+                            self.sender.send(SynthMessage::ChangeOscillatorFilter(
+                                i, filter_type.clone(), filter_cutoff, filter_resonance
+                            )).ok();
+                            oscillator.filter_resonance = filter_resonance;
+                        }
+                    });
+                });
+            });
+        }
+        
         // ADSR controls
-        ui.heading("Envelope");
+        ui.heading("Master Envelope");
         ui.horizontal(|ui| {
-            let mut synth = self.synth.write().unwrap();
-            
             ui.label("Attack:");
             if ui.add(egui::Slider::new(&mut synth.attack, 0.01..=2.0).text("s")).changed() {
-                self.sender.send(SynthMessage::ChangeAttack(synth.attack)).ok();
+                self.sender.send(SynthMessage::ChangeMasterEnvelope(synth.attack, synth.decay, synth.sustain, synth.release)).ok();
             }
             
             ui.label("Decay:");
             if ui.add(egui::Slider::new(&mut synth.decay, 0.01..=2.0).text("s")).changed() {
-                self.sender.send(SynthMessage::ChangeDecay(synth.decay)).ok();
+                self.sender.send(SynthMessage::ChangeMasterEnvelope(synth.attack, synth.decay, synth.sustain, synth.release)).ok();
             }
             
             ui.label("Sustain:");
             if ui.add(egui::Slider::new(&mut synth.sustain, 0.0..=1.0).text("")).changed() {
-                self.sender.send(SynthMessage::ChangeSustain(synth.sustain)).ok();
+                self.sender.send(SynthMessage::ChangeMasterEnvelope(synth.attack, synth.decay, synth.sustain, synth.release)).ok();
             }
             
             ui.label("Release:");
             if ui.add(egui::Slider::new(&mut synth.release, 0.01..=5.0).text("s")).changed() {
-                self.sender.send(SynthMessage::ChangeRelease(synth.release)).ok();
+                self.sender.send(SynthMessage::ChangeMasterEnvelope(synth.attack, synth.decay, synth.sustain, synth.release)).ok();
             }
         });
         
@@ -669,34 +1368,10 @@ impl SynthApp {
         ui.heading("Current Waveform");
         
         // Create points for the waveform display
-        let wavetable_points: Vec<[f64; 2]> = {
-            let synth = self.synth.read().unwrap();
-            (0..WAVEFORM_DISPLAY_POINTS)
-                .map(|i| {
-                    let x = i as f64 / WAVEFORM_DISPLAY_POINTS as f64;
-                    let phase = x * 2.0 * std::f64::consts::PI;
-                    
-                    // Get the appropriate sample based on the current waveform
-                    let y = match synth.waveform {
-                        Waveform::Sine => (phase.sin()) as f64,
-                        Waveform::Square => if phase.sin() >= 0.0 { 0.8 } else { -0.8 },
-                        Waveform::Saw => (phase / std::f64::consts::PI - 1.0) as f64,
-                        Waveform::Triangle => (2.0 * (phase / std::f64::consts::PI).abs() - 1.0) as f64,
-                        Waveform::WhiteNoise => 0.0, // We can't show random noise in a static plot
-                        Waveform::CustomSample(idx) => {
-                            if let Some(wavetable) = synth.custom_wavetables.get(idx) {
-                                let sample_idx = (x * wavetable.samples.len() as f64) as usize % wavetable.samples.len();
-                                wavetable.samples[sample_idx] as f64
-                            } else {
-                                0.0
-                            }
-                        }
-                    };
-                    
-                    [x, y]
-                })
-                .collect()
-        };
+        let wavetable_points: Vec<[f64; 2]> = synth.generate_wavetable_display()
+            .iter()
+            .map(|[x, y]| [*x as f64, *y as f64])
+            .collect();
         
         // Display the 2D waveform plot
         Plot::new("wavetable_plot")
@@ -714,13 +1389,34 @@ impl SynthApp {
             });
         
         // Volume control
-        ui.heading("Volume");
+        ui.heading("Master Volume");
         ui.horizontal(|ui| {
-            let mut synth = self.synth.write().unwrap();
             if ui.add(egui::Slider::new(&mut synth.volume, 0.0..=1.0).text("Volume")).changed() {
                 self.sender.send(SynthMessage::SetVolume(synth.volume)).ok();
             }
         });
+        
+        // Sample loading button
+        ui.heading("Samples");
+        if ui.button("Load Sample").clicked() {
+            if let Some(path) = FileDialog::new()
+                .add_filter("WAV files", &["wav"])
+                .pick_file() {
+                if let Err(err) = synth.load_sample(path.clone()) {
+                    println!("Failed to load sample: {}", err);
+                } else {
+                    println!("Sample loaded successfully");
+                }
+            }
+        }
+        
+        // Display loaded samples
+        if !synth.custom_wavetables.is_empty() {
+            ui.label("Loaded Samples:");
+            for (i, wavetable) in synth.custom_wavetables.iter().enumerate() {
+                ui.label(format!("{}: {}", i + 1, wavetable.name));
+            }
+        }
     }
     
     fn render_audio_settings(&mut self, ui: &mut egui::Ui) {
@@ -767,8 +1463,8 @@ impl SynthApp {
         } else {
             egui::ComboBox::new("midi_port_selector", "Select MIDI Port")
                 .selected_text(self.midi_ports.get(self.selected_midi_port)
-                    .cloned()
-                    .unwrap_or_else(|| "No port".to_string()))
+                .cloned()
+                .unwrap_or_else(|| "No port".to_string()))
                 .show_ui(ui, |ui| {
                     for (idx, port_name) in self.midi_ports.iter().enumerate() {
                         ui.selectable_value(&mut self.selected_midi_port, idx, port_name);
@@ -989,6 +1685,113 @@ impl SynthApp {
             }
         }
     }
+
+    // Add a method to save a preset
+    fn save_preset(&mut self, name: String) -> Result<()> {
+        let synth = self.synth.read().unwrap();
+        let preset = synth.create_preset(name.clone());
+        
+        // Check if preset with this name already exists
+        if let Some(pos) = self.presets.iter().position(|p| p.name == name) {
+            // Replace existing preset
+            self.presets[pos] = preset.clone();
+        } else {
+            // Add new preset
+            self.presets.push(preset.clone());
+        }
+        
+        // Save presets to file
+        self.save_presets_to_file()?;
+        
+        // Update current preset name
+        self.current_preset_name = name;
+        
+        // Update app settings
+        self.app_settings.last_preset = Some(self.current_preset_name.clone());
+        self.save_app_settings()?;
+        
+        Ok(())
+    }
+    
+    // Add a method to load a preset
+    fn load_preset(&mut self, name: &str) -> Result<()> {
+        if let Some(preset) = self.presets.iter().find(|p| p.name == name) {
+            let mut synth = self.synth.write().unwrap();
+            synth.apply_preset(preset);
+            
+            // Update current preset name
+            self.current_preset_name = name.to_string();
+            
+            // Update app settings
+            self.app_settings.last_preset = Some(self.current_preset_name.clone());
+            self.save_app_settings()?;
+        }
+        
+        Ok(())
+    }
+    
+    // Add a method to delete a preset
+    fn delete_preset(&mut self, name: &str) -> Result<()> {
+        if let Some(pos) = self.presets.iter().position(|p| p.name == name) {
+            self.presets.remove(pos);
+            
+            // Save presets to file
+            self.save_presets_to_file()?;
+            
+            // If we deleted the current preset, clear the current preset name
+            if self.current_preset_name == name {
+                self.current_preset_name = String::new();
+                self.app_settings.last_preset = None;
+                self.save_app_settings()?;
+            }
+        }
+        
+        Ok(())
+    }
+    
+    // Add a method to save presets to file
+    fn save_presets_to_file(&self) -> Result<()> {
+        // Create presets directory if it doesn't exist
+        let presets_dir = Self::get_presets_dir()?;
+        fs::create_dir_all(&presets_dir)?;
+        
+        // Save each preset to a separate file
+        for preset in &self.presets {
+            let preset_path = presets_dir.join(format!("{}.json", preset.name));
+            let preset_json = serde_json::to_string_pretty(preset)?;
+            let mut file = File::create(preset_path)?;
+            file.write_all(preset_json.as_bytes())?;
+        }
+        
+        Ok(())
+    }
+    
+    fn save_app_settings(&self) -> Result<()> {
+        // Create settings directory if it doesn't exist
+        let settings_dir = Self::get_settings_dir()?;
+        fs::create_dir_all(&settings_dir)?;
+        
+        // Save settings to file
+        let settings_path = settings_dir.join("settings.json");
+        let settings_json = serde_json::to_string_pretty(&self.app_settings)?;
+        let mut file = File::create(settings_path)?;
+        file.write_all(settings_json.as_bytes())?;
+        
+        Ok(())
+    }
+    
+    fn get_settings_dir() -> Result<PathBuf> {
+        let mut path = dirs::config_dir()
+            .ok_or_else(|| anyhow::anyhow!("Could not find config directory"))?;
+        path.push("audiotheorem2");
+        Ok(path)
+    }
+    
+    fn get_presets_dir() -> Result<PathBuf> {
+        let mut path = Self::get_settings_dir()?;
+        path.push("presets");
+        Ok(path)
+    }
 }
 
 fn create_stream<T>(
@@ -1025,4 +1828,30 @@ where
     )?;
     
     Ok(stream)
+}
+
+// Preset structure for saving/loading synth settings
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SynthPreset {
+    name: String,
+    oscillators: [Oscillator; 3],
+    oscillator_combination_mode: OscillatorCombinationMode,
+    attack: f32,
+    decay: f32,
+    sustain: f32,
+    release: f32,
+    master_filter_type: FilterType,
+    master_filter_cutoff: f32,
+    master_filter_resonance: f32,
+    volume: f32,
+}
+
+// App settings structure
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AppSettings {
+    selected_midi_port: Option<String>,
+    selected_output_device: Option<String>,
+    selected_input_device: Option<String>,
+    volume: f32,
+    last_preset: Option<String>,
 }
