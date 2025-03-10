@@ -3,7 +3,7 @@
 version = 4
 
 [[package]]
-name = "AT2"
+name = "AudioTheorem"
 version = "0.1.0"
 dependencies = [
  "anyhow",

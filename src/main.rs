@@ -1,8 +1,12 @@
 use eframe::egui;
 use anyhow::Result;
 
-mod at2;
-
+mod app;
+mod audio;
+mod synth;
+mod visualizer;
+mod oscillator;
+mod note;
 fn main() -> Result<()> {
     // Initialize logging for better debugging
     env_logger::init();
@@ -10,7 +14,7 @@ fn main() -> Result<()> {
     
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1200.0, 800.0])
+            .with_inner_size([1600.0, 1200.0])
             .with_icon(eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png"))?),
         ..Default::default()
     };
@@ -21,7 +25,7 @@ fn main() -> Result<()> {
         options,
         Box::new(|_cc| {
             println!("[MAIN] Creating SynthApp instance");
-            let app = match at2::SynthApp::new() {
+            let app = match app::SynthApp::new() {
                 Ok(app) => {
                     println!("[MAIN] SynthApp created successfully");
                     app
