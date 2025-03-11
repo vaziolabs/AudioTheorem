@@ -1,6 +1,9 @@
-use crate::oscillator::{Waveform, Oscillator, OscillatorCombinationMode, CustomWavetable};
-use crate::audio;
+//! Visualization utilities for waveforms and audio analysis
 
+use crate::core::oscillator::{Waveform, Oscillator, OscillatorCombinationMode, CustomWavetable};
+use std::f32::consts::PI;
+
+/// Generate a waveform preview for a single oscillator
 pub fn generate_waveform_preview(
     waveform: &Waveform,
     detune: f32,
@@ -21,7 +24,7 @@ pub fn generate_waveform_preview(
         
         // Get waveform value based on the oscillator's waveform type
         let value = match waveform {
-            Waveform::Sine => (2.0 * std::f32::consts::PI * mod_phase).sin(),
+            Waveform::Sine => (2.0 * PI * mod_phase).sin(),
             Waveform::Square => if mod_phase < 0.5 { 1.0 } else { -1.0 },
             Waveform::Saw => 2.0 * mod_phase - 1.0,
             Waveform::Triangle => {
@@ -55,6 +58,7 @@ pub fn generate_waveform_preview(
     points
 }
 
+/// Generate a combined waveform display for all oscillators
 pub fn generate_wavetable_display(
     oscillators: &[Oscillator; 3],
     oscillator_combination_mode: &OscillatorCombinationMode,
@@ -75,7 +79,7 @@ pub fn generate_wavetable_display(
                 let detuned_phase = (phase * 2.0f32.powf(oscillator.detune / 12.0)) % 1.0;
                 
                 let osc_value = match &oscillator.waveform {
-                    Waveform::Sine => (2.0 * std::f32::consts::PI * detuned_phase).sin(),
+                    Waveform::Sine => (2.0 * PI * detuned_phase).sin(),
                     Waveform::Square => if detuned_phase < 0.5 { 1.0 } else { -1.0 },
                     Waveform::Saw => 2.0 * detuned_phase - 1.0,
                     Waveform::Triangle => {
@@ -108,10 +112,27 @@ pub fn generate_wavetable_display(
         }
         
         // Combine oscillator outputs based on the selected mode
-        let value = audio::combine_oscillators(&osc_samples, oscillators, oscillator_combination_mode, phase, 0.0);
+        let value = crate::core::audio::combine_oscillators(&osc_samples, oscillators, oscillator_combination_mode, phase, 0.0);
         
         points.push([phase, value]);
     }
     
     points
+}
+
+/// Generate a spectrum display based on FFT analysis of the waveform
+pub fn generate_spectrum_display(samples: &[f32], sample_rate: f32) -> Vec<[f32; 2]> {
+    // For now, a very simplified spectrum display
+    // In a real implementation, we would use FFT here
+    const SPECTRUM_POINTS: usize = 128;
+    let mut spectrum = Vec::with_capacity(SPECTRUM_POINTS);
+    
+    // Placeholder implementation
+    for i in 0..SPECTRUM_POINTS {
+        let freq = i as f32 / SPECTRUM_POINTS as f32 * sample_rate * 0.5;
+        let magnitude = (i as f32 / SPECTRUM_POINTS as f32).powf(2.0) * 0.5;
+        spectrum.push([freq, magnitude]);
+    }
+    
+    spectrum
 }

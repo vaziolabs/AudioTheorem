@@ -1,12 +1,12 @@
 use eframe::egui;
 use anyhow::Result;
 
+mod core;
+mod messaging;
+mod ui;
 mod app;
-mod audio;
-mod synth;
-mod visualizer;
-mod oscillator;
-mod note;
+mod utils;
+
 fn main() -> Result<()> {
     // Initialize logging for better debugging
     env_logger::init();
@@ -14,7 +14,8 @@ fn main() -> Result<()> {
     
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1600.0, 1200.0])
+            .with_min_inner_size([1000.0, 600.0])
+            .with_resizable(true)
             .with_icon(eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png"))?),
         ..Default::default()
     };
@@ -23,7 +24,17 @@ fn main() -> Result<()> {
     eframe::run_native(
         "AT2 Synthesizer",
         options,
-        Box::new(|_cc| {
+        Box::new(|cc| {
+            cc.egui_ctx.set_pixels_per_point(1.5);
+            // Set up responsive frame
+            let mut style = (*cc.egui_ctx.style()).clone();
+            style.spacing.item_spacing = egui::vec2(10.0, 10.0);
+            style.spacing.window_margin = egui::Margin::same(10);
+            cc.egui_ctx.set_style(style);
+            
+            // Enable responsive layout
+            cc.egui_ctx.set_visuals(egui::Visuals::dark());
+            
             println!("[MAIN] Creating SynthApp instance");
             let app = match app::SynthApp::new() {
                 Ok(app) => {

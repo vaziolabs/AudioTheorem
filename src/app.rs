@@ -9,36 +9,14 @@ use std::fs::{self, File};
 use std::io::Write;
 use serde_json;
 use dirs;
-use crate::oscillator::{CustomWavetable, FilterType, ModulationTarget, OscillatorCombinationMode, Waveform};
-use crate::synth::{Synth, SynthPreset, WAVEFORM_DISPLAY_POINTS};
-use egui_plot::{Plot, Line, PlotPoints};
-
-// Message types for our threaded architecture
-enum SynthMessage {
-    NoteOn(u8, u8),
-    NoteOff(u8),
-    ChangeOscillator(usize, Waveform, f32, f32, i8), // (osc_index, waveform, volume, detune, octave)
-    ChangeOscillatorEnvelope(usize, f32, f32, f32, f32), // (osc_index, attack, decay, sustain, release)
-    ChangeOscillatorFilter(usize, FilterType, f32, f32), // (osc_index, filter_type, cutoff, resonance)
-    ChangeOscillatorModulation(usize, f32, ModulationTarget), // (osc_index, amount, target)
-    ChangeOscillatorCombinationMode(OscillatorCombinationMode),
-    ChangeMasterEnvelope(f32, f32, f32, f32), // (attack, decay, sustain, release)
-    ChangeMasterFilter(FilterType, f32, f32), // (filter_type, cutoff, resonance)
-    ChangeVolume(f32),
-    LoadSample(PathBuf),
-    SetVolume(f32),
-    SetModulation(f32),
-    SetSustainPedal(bool),
-    SetPitchBend(f32),
-    SetAftertouch(u8, f32),
-    SetChannelPressure(f32),
-}
+use crate::core::synth::Synth;
+use crate::core::synth::preset::SynthPreset;
+use crate::messaging::{SynthMessage, MessageBus};
 
 // Main app state
 pub struct SynthApp {
     synth: Arc<RwLock<Synth>>,
-    sender: crossbeam_channel::Sender<SynthMessage>,
-    receiver: crossbeam_channel::Receiver<SynthMessage>,
+    message_bus: MessageBus,
     _stream: Option<Stream>,
     _midi_connection: Option<midir::MidiInputConnection<()>>,
     midi_ports: Vec<String>,
@@ -57,7 +35,7 @@ pub struct SynthApp {
 }
 
 impl eframe::App for SynthApp {
-    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Process any pending messages
         self.process_messages();
         
@@ -137,11 +115,11 @@ impl SynthApp {
         let sample_rate = config.sample_rate.0 as f32;
         println!("Using sample rate: {}", sample_rate);
         
-        // Create a channel for message passing
-        let (sender, receiver) = crossbeam_channel::unbounded();
-        
-        // Create the synth state
+        // Create the synth state first
         let synth = Arc::new(RwLock::new(Synth::new(sample_rate)));
+        
+        // Then create the message bus with a reference to synth
+        let message_bus = MessageBus::new(Arc::clone(&synth));
         
         // Set up audio callback
         let stream = match sample_format {
@@ -170,13 +148,13 @@ impl SynthApp {
         }
         println!("Found {} input devices", available_input_devices.len());
         
-        println!("[MAIN] SynthApp created successfully");
-        
         // Load app settings
+        let app_settings = Self::load_app_settings().unwrap_or_default();
+        
+        // Initialize the SynthApp
         let mut app = SynthApp {
             synth,
-            sender,
-            receiver,
+            message_bus,
             _stream: Some(stream),
             _midi_connection: None,
             midi_ports: Vec::new(),
@@ -190,108 +168,39 @@ impl SynthApp {
             show_sample_dialog: false,
             presets: Vec::new(),
             current_preset_name: String::new(),
-            app_settings: AppSettings {
-                selected_midi_port: None,
-                selected_output_device: None,
-                selected_input_device: None,
-                volume: 0.5,
-                last_preset: None,
-            },
+            app_settings,
             should_exit: false,
         };
         
-        if let Ok(settings) = Self::load_app_settings() {
-            app.selected_midi_port = settings.selected_midi_port
-                .and_then(|name| app.midi_ports.iter().position(|p| p == &name))
-                .unwrap_or(0);
-            
-            app.selected_output_device_idx = settings.selected_output_device
-                .and_then(|name| app.available_output_devices.iter().position(|d| d.name().ok() == Some(name.clone())))
-                .unwrap_or(0);
-            
-            app.app_settings.volume = settings.volume;
-            
-            // Load last preset if available
-            if let Some(preset_name) = settings.last_preset {
-                app.load_preset(&preset_name).ok();
+        // Refresh MIDI ports after initialization
+        app.refresh_midi_ports();
+        
+        // If there was a previously selected MIDI port, try to reconnect
+        if let Some(ref port_name) = app.app_settings.selected_midi_port {
+            if let Some(port_idx) = app.midi_ports.iter().position(|p| p == port_name) {
+                app.selected_midi_port = port_idx;
+                app.connect_midi_port(port_idx);
             }
         }
         
+        println!("[MAIN] SynthApp created successfully");
         Ok(app)
     }
     
     fn process_messages(&mut self) {
-        // Process a limited number of messages per frame
-        const MAX_MESSAGES_PER_FRAME: usize = 10;
-        let mut count = 0;
-        
-        while let Ok(msg) = self.receiver.try_recv() {
+        // Process any pending messages from the message bus
+        while let Ok(msg) = self.message_bus.try_receive() {
             match msg {
                 SynthMessage::NoteOn(note, velocity) => {
+                    // Handle note on message
                     if let Ok(mut synth) = self.synth.write() {
                         synth.note_on(note, velocity);
                     }
                 },
                 SynthMessage::NoteOff(note) => {
+                    // Handle note off message
                     if let Ok(mut synth) = self.synth.write() {
                         synth.note_off(note);
-                    }
-                },
-                SynthMessage::ChangeOscillator(index, waveform, volume, detune, octave) => {
-                    if let Ok(mut synth) = self.synth.write() {
-                        if index < synth.oscillators.len() {
-                            synth.oscillators[index].waveform = waveform;
-                            synth.oscillators[index].volume = volume;
-                            synth.oscillators[index].detune = detune;
-                            synth.oscillators[index].octave = octave;
-                        }
-                    }
-                },
-                SynthMessage::ChangeOscillatorEnvelope(index, attack, decay, sustain, release) => {
-                    if let Ok(mut synth) = self.synth.write() {
-                        if index < synth.oscillators.len() {
-                            synth.oscillators[index].attack = attack;
-                            synth.oscillators[index].decay = decay;
-                            synth.oscillators[index].sustain = sustain;
-                            synth.oscillators[index].release = release;
-                        }
-                    }
-                },
-                SynthMessage::ChangeOscillatorFilter(index, filter_type, cutoff, resonance) => {
-                    if let Ok(mut synth) = self.synth.write() {
-                        if index < synth.oscillators.len() {
-                            synth.oscillators[index].filter_type = filter_type;
-                            synth.oscillators[index].filter_cutoff = cutoff;
-                            synth.oscillators[index].filter_resonance = resonance;
-                        }
-                    }
-                },
-                SynthMessage::ChangeOscillatorModulation(index, amount, target) => {
-                    if let Ok(mut synth) = self.synth.write() {
-                        if index < synth.oscillators.len() {
-                            synth.oscillators[index].mod_amount = amount;
-                            synth.oscillators[index].mod_target = target;
-                        }
-                    }
-                },
-                SynthMessage::ChangeOscillatorCombinationMode(mode) => {
-                    if let Ok(mut synth) = self.synth.write() {
-                        synth.oscillator_combination_mode = mode;
-                    }
-                },
-                SynthMessage::ChangeMasterEnvelope(attack, decay, sustain, release) => {
-                    if let Ok(mut synth) = self.synth.write() {
-                        synth.attack = attack;
-                        synth.decay = decay;
-                        synth.sustain = sustain;
-                        synth.release = release;
-                    }
-                },
-                SynthMessage::ChangeMasterFilter(filter_type, cutoff, resonance) => {
-                    if let Ok(mut synth) = self.synth.write() {
-                        synth.master_filter_type = filter_type;
-                        synth.master_filter_cutoff = cutoff;
-                        synth.master_filter_resonance = resonance;
                     }
                 },
                 SynthMessage::SetVolume(volume) => {
@@ -299,424 +208,400 @@ impl SynthApp {
                         synth.volume = volume;
                     }
                 },
-                SynthMessage::SetModulation(modulation) => {
-                    if let Ok(mut synth) = self.synth.write() {
-                        for oscillator in &mut synth.oscillators {
-                            oscillator.mod_amount = modulation;
-                        }
-                    }
-                },
-                SynthMessage::SetSustainPedal(on) => {
-                    if let Ok(mut synth) = self.synth.write() {
-                        for oscillator in &mut synth.oscillators {
-                            oscillator.sustain = if on { 1.0 } else { 0.0 };
-                        }
-                    }
-                },
-                SynthMessage::SetPitchBend(bend) => {
-                    if let Ok(mut synth) = self.synth.write() {
-                        for oscillator in &mut synth.oscillators {
-                            oscillator.pitch_bend = bend;
-                        }
-                    }
-                },
-                SynthMessage::SetAftertouch(note, pressure) => {
-                    if let Ok(mut synth) = self.synth.write() {
-                        for oscillator in &mut synth.oscillators {
-                            if oscillator.note == Some(note) {
-                                oscillator.aftertouch = pressure;
-                            }
-                        }
-                    }
-                },
-                SynthMessage::SetChannelPressure(pressure) => {
-                    if let Ok(mut synth) = self.synth.write() {
-                        for oscillator in &mut synth.oscillators {
-                            oscillator.channel_pressure = pressure;
-                        }
-                    }
-                },
-                SynthMessage::LoadSample(path) => {
-                    if let Ok(mut synth) = self.synth.write() {
-                        if let Err(e) = synth.load_sample(path) {
-                            eprintln!("Error loading sample: {}", e);
-                        }
-                    }
-                },
+                // Handle other messages...
                 _ => {}
-            }
-            
-            count += 1;
-            if count >= MAX_MESSAGES_PER_FRAME {
-                break;
             }
         }
     }
 
     fn render_synth_ui(&mut self, ui: &mut egui::Ui) {
-        // First, get a read-only view of the current state
-        let synth_view = self.synth.read().unwrap();
+        ui.heading("Synthesizer");
         
-        // Create temporary variables to hold UI state
-        let mut temp_oscillators: Vec<_> = synth_view.oscillators.iter().map(|osc| {
-            (
-                osc.waveform.clone(),
-                osc.volume,
-                osc.detune,
-                osc.octave
-            )
-        }).collect();
+        // Get available width and calculate per-oscillator width
+        let available_width = ui.available_width();
+        let osc_width = (available_width - 40.0) / 3.0; // 40.0 accounts for spacing
         
-        ui.columns(3, |columns| {
-            for (i, col) in columns.iter_mut().enumerate() {
-                col.vertical(|ui| {
-                    // Push a unique ID for this oscillator's UI elements
-                    ui.push_id(i, |ui| {
-                        ui.heading(format!("Oscillator {}", i + 1));
+        ui.horizontal(|ui| {
+            for i in 0..3 {
+                let oscillator = if i < self.synth.read().unwrap().oscillators.len() {
+                    &self.synth.read().unwrap().oscillators[i]
+                } else {
+                    continue; // Skip if oscillator doesn't exist
+                };
+                
+                ui.push_id(format!("oscillator_section_{}", i), |ui| {
+                    // Use a vertical with constrained width
+                    ui.vertical(|ui| {
+                        ui.set_max_width(osc_width);
+                        ui.set_min_width(osc_width);
+                        ui.heading(format!("Oscillator {}", i+1));
                         
                         // Generate oscillator-specific waveform preview
-                        let preview_points = crate::visualizer::generate_waveform_preview(
-                            &temp_oscillators[i].0,
-                            temp_oscillators[i].2,
-                            temp_oscillators[i].3,
-                            &synth_view.custom_wavetables
+                        let preview_points = crate::utils::audio_visualizer::generate_waveform_preview(
+                            &oscillator.waveform,
+                            &self.synth.read().unwrap().custom_wavetables,
+                            100 // number of samples
                         );
                         
-                        // Waveform visualization
-                        let plot = Plot::new(format!("osc_{}", i))
-                            .height(100.0)
-                            .show_x(false)
-                            .show_y(false);
+                        // Waveform visualization with height only
+                        crate::ui::components::WaveformPlot::new(preview_points)
+                            .height(80.0)
+                            .show(ui, "waveform_preview");
                         
-                        plot.show(ui, |plot_ui| {
-                            plot_ui.line(Line::new(PlotPoints::from_iter(
-                                preview_points.iter().map(|[x, y]| [*x as f64, *y as f64])
-                            )).color(egui::Color32::from_rgb(0, 188, 212)));
-                        });
-
-                        // Waveform selector
-                        let mut current_waveform = temp_oscillators[i].0.clone();
-                        egui::ComboBox::from_label("Waveform")
-                            .selected_text(format!("{:?}", current_waveform))
-                            .show_ui(ui, |ui| {
-                                for waveform in &[Waveform::Sine, Waveform::Square, 
-                                               Waveform::Saw, Waveform::Triangle, 
-                                               Waveform::WhiteNoise] {
-                                    if ui.selectable_value(&mut current_waveform, waveform.clone(), 
-                                                          format!("{:?}", waveform)).changed() {
-                                        // Send message to update the actual synth
-                                        self.sender.send(SynthMessage::ChangeOscillator(
-                                            i, 
-                                            waveform.clone(),
-                                            temp_oscillators[i].1,
-                                            temp_oscillators[i].2,
-                                            temp_oscillators[i].3
-                                        )).ok();
-                                    }
+                        // Oscillator controls
+                        ui.horizontal(|ui| {
+                            ui.label("Waveform:");
+                            let mut waveform = oscillator.waveform.clone();
+                            let waveform_changed = egui::ComboBox::new("waveform_selector", "")
+                                .selected_text(format!("{:?}", waveform))
+                                .show_ui(ui, |ui| {
+                                    use crate::core::oscillator::Waveform;
+                                    ui.selectable_value(&mut waveform, Waveform::Sine, "Sine");
+                                    ui.selectable_value(&mut waveform, Waveform::Square, "Square");
+                                    ui.selectable_value(&mut waveform, Waveform::Saw, "Saw");
+                                    ui.selectable_value(&mut waveform, Waveform::Triangle, "Triangle");
+                                    ui.selectable_value(&mut waveform, Waveform::WhiteNoise, "White Noise");
+                                })
+                                .response.changed();
+                                    
+                            if waveform_changed {
+                                if let Ok(mut synth) = self.synth.write() {
+                                    synth.oscillators[i].waveform = waveform;
                                 }
-                            });
-                        temp_oscillators[i].0 = current_waveform;
-
-                        // Volume control
-                        let mut volume = temp_oscillators[i].1;
-                        if ui.add(egui::Slider::new(&mut volume, 0.0..=1.0).text("Volume")).changed() {
-                            temp_oscillators[i].1 = volume;
-                            self.sender.send(SynthMessage::ChangeOscillator(
-                                i, 
-                                temp_oscillators[i].0.clone(),
-                                volume,
-                                temp_oscillators[i].2,
-                                temp_oscillators[i].3
-                            )).ok();
-                        }
+                            }
+                        });
                         
-                        // Detune control
-                        let mut detune = temp_oscillators[i].2;
-                        if ui.add(egui::Slider::new(&mut detune, -12.0..=12.0).text("Detune")).changed() {
-                            temp_oscillators[i].2 = detune;
-                            self.sender.send(SynthMessage::ChangeOscillator(
-                                i, 
-                                temp_oscillators[i].0.clone(),
-                                temp_oscillators[i].1,
-                                detune,
-                                temp_oscillators[i].3
-                            )).ok();
-                        }
+                        // Volume, detune, octave
+                        ui.horizontal(|ui| {
+                            ui.label("Volume:");
+                            let mut volume = oscillator.volume;
+                            if ui.add(egui::Slider::new(&mut volume, 0.0..=1.0)).changed() {
+                                if let Ok(mut synth) = self.synth.write() {
+                                    synth.oscillators[i].volume = volume;
+                                }
+                            }
+                        });
                         
-                        // Octave control
-                        let mut octave = temp_oscillators[i].3;
-                        if ui.add(egui::Slider::new(&mut octave, -2..=2).text("Octave")).changed() {
-                            temp_oscillators[i].3 = octave;
-                            self.sender.send(SynthMessage::ChangeOscillator(
-                                i, 
-                                temp_oscillators[i].0.clone(),
-                                temp_oscillators[i].1,
-                                temp_oscillators[i].2,
-                                octave
-                            )).ok();
-                        }
+                        ui.horizontal(|ui| {
+                            ui.label("Detune:");
+                            let mut detune = oscillator.detune;
+                            if ui.add(egui::Slider::new(&mut detune, -12.0..=12.0)).changed() {
+                                if let Ok(mut synth) = self.synth.write() {
+                                    synth.oscillators[i].detune = detune;
+                                }
+                            }
+                        });
+                        
+                        ui.horizontal(|ui| {
+                            ui.label("Octave:");
+                            let mut octave = oscillator.octave;
+                            if ui.add(egui::Slider::new(&mut octave, -4..=4)).changed() {
+                                if let Ok(mut synth) = self.synth.write() {
+                                    synth.oscillators[i].octave = octave;
+                                }
+                            }
+                        });
+                        
+                        // ADSR controls
+                        ui.collapsing("Envelope", |ui| {
+                            let mut attack = oscillator.attack;
+                            let mut decay = oscillator.decay;
+                            let mut sustain = oscillator.sustain;
+                            let mut release = oscillator.release;
+                            
+                            let attack_changed = ui.add(egui::Slider::new(&mut attack, 0.01..=2.0).text("Attack")).changed();
+                            let decay_changed = ui.add(egui::Slider::new(&mut decay, 0.01..=2.0).text("Decay")).changed();
+                            let sustain_changed = ui.add(egui::Slider::new(&mut sustain, 0.0..=1.0).text("Sustain")).changed();
+                            let release_changed = ui.add(egui::Slider::new(&mut release, 0.01..=3.0).text("Release")).changed();
+                            
+                            if attack_changed || decay_changed || sustain_changed || release_changed {
+                                if let Ok(mut synth) = self.synth.write() {
+                                    synth.oscillators[i].attack = attack;
+                                    synth.oscillators[i].decay = decay;
+                                    synth.oscillators[i].sustain = sustain;
+                                    synth.oscillators[i].release = release;
+                                }
+                            }
+                        });
+                        
+                        // Filter controls
+                        ui.collapsing("Filter", |ui| {
+                            let mut filter_type = oscillator.filter_type.clone();
+                            let mut filter_cutoff = oscillator.filter_cutoff;
+                            let mut filter_resonance = oscillator.filter_resonance;
+                            
+                            let filter_type_changed = egui::ComboBox::new("filter_type_selector", "Type")
+                                .selected_text(format!("{:?}", filter_type))
+                                .show_ui(ui, |ui| {
+                                    use crate::core::oscillator::FilterType;
+                                    ui.selectable_value(&mut filter_type, FilterType::LowPass, "Low Pass");
+                                    ui.selectable_value(&mut filter_type, FilterType::HighPass, "High Pass");
+                                    ui.selectable_value(&mut filter_type, FilterType::BandPass, "Band Pass");
+                                    ui.selectable_value(&mut filter_type, FilterType::Notch, "Notch");
+                                })
+                                .response.changed();
+                                    
+                            let cutoff_changed = ui.add(egui::Slider::new(&mut filter_cutoff, 0.01..=1.0).text("Cutoff")).changed();
+                            let resonance_changed = ui.add(egui::Slider::new(&mut filter_resonance, 0.01..=1.0).text("Resonance")).changed();
+                            
+                            if filter_type_changed || cutoff_changed || resonance_changed {
+                                if let Ok(mut synth) = self.synth.write() {
+                                    synth.oscillators[i].filter_type = filter_type;
+                                    synth.oscillators[i].filter_cutoff = filter_cutoff;
+                                    synth.oscillators[i].filter_resonance = filter_resonance;
+                                }
+                            }
+                        });
                     });
                 });
+                
+                // Add a small visual separator except after the last oscillator
+                if i < 2 {
+                    ui.add_space(20.0);
+                }
             }
         });
-
-        // Master visualization
+        
+        ui.add_space(10.0);
+        
         ui.separator();
-        ui.heading("Master Output");
         
-        let master_points = synth_view.generate_waveform_display();
-        let plot = Plot::new("master_waveform")
-            .height(150.0)
-            .show_x(false)
-            .show_y(false);
+        // Master section below oscillators
+        ui.heading("Master");
         
-        plot.show(ui, |plot_ui| {
-            plot_ui.line(Line::new(PlotPoints::from_iter(
-                master_points.iter().map(|[x, y]| [*x as f64, *y as f64])
-            )).color(egui::Color32::from_rgb(0, 188, 212)));
-        });
-    }
-    
-    // Add this helper method to generate oscillator preview
-    fn generate_oscillator_preview(&self, waveform: &Waveform, detune: f32, octave: i8, 
-                                  custom_wavetables: &[CustomWavetable]) -> Vec<[f32; 2]> {
-        const PREVIEW_POINTS: usize = 100;
-        let mut points = Vec::with_capacity(PREVIEW_POINTS);
-        
-        // Apply octave shift and detune to the phase
-        let octave_factor = 2.0f32.powf(octave as f32);
-        let detune_factor = 2.0f32.powf(detune / 12.0);
-        let frequency_factor = octave_factor * detune_factor;
-        
-        for i in 0..PREVIEW_POINTS {
-            let phase = i as f32 / PREVIEW_POINTS as f32;
-            let mod_phase = (phase * frequency_factor) % 1.0;
+        if let Ok(synth) = self.synth.read() {
+            // Generate combined waveform display from all oscillators
+            let waveform_points = crate::utils::audio_visualizer::generate_wavetable_display(
+                synth.oscillators.as_slice(),
+                &synth.oscillator_combination_mode,
+                &synth.custom_wavetables
+            );
             
-            // Get waveform value based on the oscillator's waveform type
-            let value = match waveform {
-                Waveform::Sine => (2.0 * std::f32::consts::PI * mod_phase).sin(),
-                Waveform::Square => if mod_phase < 0.5 { 1.0 } else { -1.0 },
-                Waveform::Saw => 2.0 * mod_phase - 1.0,
-                Waveform::Triangle => {
-                    if mod_phase < 0.25 {
-                        4.0 * mod_phase
-                    } else if mod_phase < 0.75 {
-                        2.0 - 4.0 * mod_phase
-                    } else {
-                        -4.0 + 4.0 * mod_phase
-                    }
-                },
-                Waveform::WhiteNoise => {
-                    // For visualization, use a deterministic "random" function
-                    let seed = (i * 100) as f32;
-                    (seed.sin() * 12.5).sin()
-                },
-                Waveform::CustomSample(index) => {
-                    if let Some(wavetable) = custom_wavetables.get(*index) {
-                        let sample_pos = mod_phase * wavetable.samples.len() as f32;
-                        let index = sample_pos.floor() as usize % wavetable.samples.len();
-                        wavetable.samples[index]
-                    } else {
-                        0.0
+            // Display waveform
+            crate::ui::components::WaveformPlot::new(waveform_points)
+                .height(150.0)
+                .color(egui::Color32::from_rgb(0, 188, 212))
+                .show(ui, "master_waveform");
+            
+            // Volume and combination mode controls
+            ui.horizontal(|ui| {
+                ui.label("Master Volume:");
+                let mut volume = synth.volume;
+                if ui.add(egui::Slider::new(&mut volume, 0.0..=1.0)).changed() {
+                    if let Ok(mut synth) = self.synth.write() {
+                        synth.volume = volume;
                     }
                 }
-            };
+                
+                ui.label("Combination Mode:");
+                let mut current_mode = synth.oscillator_combination_mode.clone();
+                egui::ComboBox::new("combination_mode", "")
+                    .selected_text(format!("{:?}", current_mode))
+                    .show_ui(ui, |ui| {
+                        use crate::core::oscillator::OscillatorCombinationMode;
+                        ui.selectable_value(&mut current_mode, OscillatorCombinationMode::Parallel, "Parallel");
+                        ui.selectable_value(&mut current_mode, OscillatorCombinationMode::FM, "FM");
+                        ui.selectable_value(&mut current_mode, OscillatorCombinationMode::AM, "AM");
+                        ui.selectable_value(&mut current_mode, OscillatorCombinationMode::RingMod, "Ring Mod");
+                        ui.selectable_value(&mut current_mode, OscillatorCombinationMode::Filter, "Filter");
+                    });
+                    
+                if current_mode != synth.oscillator_combination_mode {
+                    if let Ok(mut synth) = self.synth.write() {
+                        synth.oscillator_combination_mode = current_mode;
+                    }
+                }
+            });
             
-            points.push([phase, value]);
+            // Master ADSR controls
+            ui.collapsing("Master Envelope", |ui| {
+                let mut attack = synth.attack;
+                let mut decay = synth.decay;
+                let mut sustain = synth.sustain;
+                let mut release = synth.release;
+                
+                let attack_changed = ui.add(egui::Slider::new(&mut attack, 0.01..=2.0).text("Attack")).changed();
+                let decay_changed = ui.add(egui::Slider::new(&mut decay, 0.01..=2.0).text("Decay")).changed();
+                let sustain_changed = ui.add(egui::Slider::new(&mut sustain, 0.0..=1.0).text("Sustain")).changed();
+                let release_changed = ui.add(egui::Slider::new(&mut release, 0.01..=3.0).text("Release")).changed();
+                
+                if attack_changed || decay_changed || sustain_changed || release_changed {
+                    if let Ok(mut synth) = self.synth.write() {
+                        synth.attack = attack;
+                        synth.decay = decay;
+                        synth.sustain = sustain;
+                        synth.release = release;
+                    }
+                }
+            });
+            
+            // Master filter controls
+            ui.collapsing("Master Filter", |ui| {
+                let mut filter_type = synth.master_filter_type.clone();
+                let mut filter_cutoff = synth.master_filter_cutoff;
+                let mut filter_resonance = synth.master_filter_resonance;
+                
+                let filter_type_changed = egui::ComboBox::new("master_filter_type", "Type")
+                    .selected_text(format!("{:?}", filter_type))
+                    .show_ui(ui, |ui| {
+                        use crate::core::oscillator::FilterType;
+                        ui.selectable_value(&mut filter_type, FilterType::LowPass, "Low Pass");
+                        ui.selectable_value(&mut filter_type, FilterType::HighPass, "High Pass");
+                        ui.selectable_value(&mut filter_type, FilterType::BandPass, "Band Pass");
+                        ui.selectable_value(&mut filter_type, FilterType::Notch, "Notch");
+                    })
+                    .response.changed();
+                    
+                let cutoff_changed = ui.add(egui::Slider::new(&mut filter_cutoff, 0.01..=1.0).text("Cutoff")).changed();
+                let resonance_changed = ui.add(egui::Slider::new(&mut filter_resonance, 0.01..=1.0).text("Resonance")).changed();
+                
+                if filter_type_changed || cutoff_changed || resonance_changed {
+                    if let Ok(mut synth) = self.synth.write() {
+                        synth.master_filter_type = filter_type;
+                        synth.master_filter_cutoff = filter_cutoff;
+                        synth.master_filter_resonance = filter_resonance;
+                    }
+                }
+            });
         }
         
-        points
+        // Preset controls at the bottom
+        ui.separator();
+        ui.collapsing("Presets", |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Preset Name:");
+                ui.text_edit_singleline(&mut self.current_preset_name);
+            });
+            
+            ui.horizontal(|ui| {
+                if ui.button("Save Preset").clicked() && !self.current_preset_name.is_empty() {
+                    self.save_preset(self.current_preset_name.clone()).ok();
+                }
+                
+                if ui.button("Load Selected").clicked() && !self.current_preset_name.is_empty() {
+                    let preset_name = self.current_preset_name.clone();
+                    self.load_preset(&preset_name).ok();
+                }
+            });
+            
+            ui.separator();
+            for preset in &self.presets {
+                if ui.selectable_label(self.current_preset_name == preset.name, &preset.name).clicked() {
+                    self.current_preset_name = preset.name.clone();
+                }
+            }
+        });
     }
     
     fn render_audio_settings(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Audio Device Settings");
+        ui.heading("Audio Settings");
         
-        // Output device selection
-        ui.label("Output Device:");
-        
-        if self.available_output_devices.is_empty() {
-            ui.label("No output devices available");
-        } else {
-            egui::ComboBox::new("output_device_selector", "Select Output")
-                .selected_text(self.available_output_devices
-                    .get(self.selected_output_device_idx)
-                    .and_then(|d| d.name().ok())
-                    .unwrap_or_else(|| "No device".to_string()))
-                .show_ui(ui, |ui| {
-                    for (idx, device) in self.available_output_devices.iter().enumerate() {
-                        if let Ok(name) = device.name() {
-                            ui.selectable_value(&mut self.selected_output_device_idx, idx, name);
-                        } else {
-                            ui.selectable_value(&mut self.selected_output_device_idx, idx, format!("Device {}", idx));
-                        }
+        // Output device selector
+        ui.group(|ui| {
+            ui.label("Output Device:");
+            
+            for (i, device) in self.available_output_devices.iter().enumerate() {
+                if let Ok(name) = device.name() {
+                    let name_str = name.clone();
+                    if ui.radio_value(&mut self.selected_output_device_idx, i, &name_str).clicked() {
+                        self.app_settings.selected_output_device = Some(name_str);
+                        self.save_app_settings().ok();
                     }
-                });
+                }
+            }
+            
+            if ui.button("Refresh Devices").clicked() {
+                // Refresh the device list
+                let host = cpal::default_host();
                 
-            if ui.button("Apply Audio Device Changes").clicked() {
-                self.change_audio_devices();
+                self.available_output_devices.clear();
+                if let Ok(devices) = host.output_devices() {
+                    for device in devices {
+                        self.available_output_devices.push(device);
+                    }
+                }
+            }
+        });
+        
+        // Master volume control
+        ui.horizontal(|ui| {
+            ui.label("Master Volume:");
+            let mut volume = self.app_settings.volume;
+            if ui.add(egui::Slider::new(&mut volume, 0.0..=1.0)).changed() {
+                self.app_settings.volume = volume;
+                self.message_bus.send(SynthMessage::SetVolume(volume));
                 self.save_app_settings().ok();
             }
-        }
+        });
     }
     
     fn render_midi_settings(&mut self, ui: &mut egui::Ui) {
         ui.heading("MIDI Settings");
         
-        // MIDI device selection
-        ui.label("MIDI Input Device:");
-        
-        if self.midi_ports.is_empty() {
-            ui.label("No MIDI devices available");
-            if ui.button("Refresh MIDI Devices").clicked() {
-                self.refresh_midi_devices();
+        // Basic MIDI port selection
+        ui.horizontal(|ui| {
+            ui.label("MIDI Input Device:");
+            
+            if ui.button("Refresh MIDI Ports").clicked() {
+                self.refresh_midi_ports();
             }
-        } else {
-            egui::ComboBox::new("midi_port_selector", "Select MIDI Port")
-                .selected_text(self.midi_ports.get(self.selected_midi_port)
-                .cloned()
-                .unwrap_or_else(|| "No port".to_string()))
-                .show_ui(ui, |ui| {
-                    for (idx, port_name) in self.midi_ports.iter().enumerate() {
-                        ui.selectable_value(&mut self.selected_midi_port, idx, port_name);
-                    }
-                });
-                
-            if ui.button("Connect MIDI Device").clicked() {
-                self.connect_midi(self.selected_midi_port);
+        });
+        
+        // MIDI port list as buttons to avoid borrowing issues
+        for i in 0..self.midi_ports.len() {
+            let port_name = self.midi_ports[i].clone();
+            let is_selected = i == self.selected_midi_port;
+            
+            if ui.radio(is_selected, &port_name).clicked() && !is_selected {
+                self.selected_midi_port = i;
+                self.connect_midi_port(i);
+                self.app_settings.selected_midi_port = Some(port_name);
                 self.save_app_settings().ok();
             }
         }
         
-        // Display last MIDI message received
+        // Show last MIDI message if available
         if let Some(msg) = &self.last_midi_message {
             ui.label(format!("Last MIDI message: {}", msg));
         }
     }
-
-    fn change_audio_devices(&mut self) {
-        println!("Changing audio devices");
+    
+    fn refresh_midi_ports(&mut self) {
+        self.midi_ports.clear();
         
-        // Get the selected output device
-        if self.selected_output_device_idx < self.available_output_devices.len() {
-            let device = &self.available_output_devices[self.selected_output_device_idx];
-            
-            // Get the device configuration
-            match device.default_output_config() {
-                Ok(config) => {
-                    let sample_format = config.sample_format();
-                    let config = cpal::StreamConfig::from(config);
-                    let sample_rate = config.sample_rate.0 as f32;
-                    
-                    // Update the synth's sample rate
-                    if let Ok(mut synth) = self.synth.write() {
-                        synth.sample_rate = sample_rate;
-                    }
-                    
-                    // Create a new audio stream
-                    let synth_clone = Arc::clone(&self.synth);
-                    let stream_result = match sample_format {
-                        SampleFormat::F32 => create_stream::<f32>(device, &config, synth_clone),
-                        SampleFormat::I16 => create_stream::<i16>(device, &config, synth_clone),
-                        SampleFormat::U16 => create_stream::<u16>(device, &config, synth_clone),
-                        _ => Err(anyhow::anyhow!("Unsupported sample format")),
-                    };
-                    
-                    // Replace the old stream with the new one
-                    match stream_result {
-                        Ok(stream) => {
-                            // Stop the old stream if it exists
-                            if let Some(old_stream) = self._stream.take() {
-                                drop(old_stream);
-                            }
-                            
-                            // Start the new stream
-                            if let Err(err) = stream.play() {
-                                println!("Failed to play stream: {}", err);
-                            } else {
-                                self._stream = Some(stream);
-                                println!("Audio device changed successfully");
-                            }
-                        },
-                        Err(err) => {
-                            println!("Failed to create stream: {}", err);
-                        }
-                    }
-                },
-                Err(err) => {
-                    println!("Failed to get device config: {}", err);
+        if let Ok(midi_in) = midir::MidiInput::new("midi-input") {
+            for port in midi_in.ports() {
+                if let Ok(port_name) = midi_in.port_name(&port) {
+                    self.midi_ports.push(port_name);
                 }
             }
         }
     }
     
-    fn refresh_midi_devices(&mut self) {
-        println!("Refreshing MIDI devices");
-        
-        // Create a new MIDI input
-        let midi_in = match midir::MidiInput::new("rust-synth-midi") {
-            Ok(midi_in) => midi_in,
-            Err(err) => {
-                println!("Failed to create MIDI input: {}", err);
-                return;
-            }
-        };
-        
-        // Get the available ports
-        let ports = midi_in.ports();
-        
-        // Get the names of the ports
-        self.midi_ports.clear();
-        for port in ports {
-            if let Ok(name) = midi_in.port_name(&port) {
-                self.midi_ports.push(name);
-            } else {
-                self.midi_ports.push(format!("Unknown port {}", self.midi_ports.len()));
-            }
-        }
-        
-        // Reset the selected port if needed
-        if !self.midi_ports.is_empty() && self.selected_midi_port >= self.midi_ports.len() {
-            self.selected_midi_port = 0;
-        }
-        
-        println!("Found {} MIDI devices", self.midi_ports.len());
-    }
-    
-    fn connect_midi(&mut self, port_idx: usize) {
-        println!("Connecting to MIDI device {}", port_idx);
-        
-        // Disconnect any existing connection
+    fn connect_midi_port(&mut self, port_idx: usize) {
+        // Disconnect existing connection if any
         self._midi_connection = None;
         
-        // Check if the port index is valid
-        if port_idx >= self.midi_ports.len() {
-            println!("Invalid MIDI port index");
-            return;
-        }
-        
-        // Create a new MIDI input
-        let mut midi_in = match midir::MidiInput::new("rust-synth-midi") {
+        // Create a new MIDI input connection
+        let midi_in = match midir::MidiInput::new("midi-input") {
             Ok(midi_in) => midi_in,
-            Err(err) => {
-                println!("Failed to create MIDI input: {}", err);
+            Err(e) => {
+                println!("Error creating MIDI input: {}", e);
                 return;
             }
         };
         
-        // Configure the MIDI input
-        midi_in.ignore(midir::Ignore::None);
-        
-        // Get the port
+        // Get ports
         let ports = midi_in.ports();
         if port_idx >= ports.len() {
-            println!("MIDI port index out of range");
+            println!("Invalid MIDI port index");
             return;
         }
         
         let port = &ports[port_idx];
         
         // Clone the sender for the callback
-        let sender = self.sender.clone();
+        let message_sender = self.message_bus.sender();
         
         // Connect to the port
         match midi_in.connect(port, "midi-connection", move |_stamp, message, _| {
@@ -730,56 +615,36 @@ impl SynthApp {
                     0x90 => {
                         // Note On
                         if data2 > 0 {
-                            sender.send(SynthMessage::NoteOn(data1, data2)).ok();
+                            message_sender.send(SynthMessage::NoteOn(data1, data2)).ok();
                         } else {
-                            sender.send(SynthMessage::NoteOff(data1)).ok();
+                            message_sender.send(SynthMessage::NoteOff(data1)).ok();
                         }
                     },
                     0x80 => {
                         // Note Off
-                        sender.send(SynthMessage::NoteOff(data1)).ok();
+                        message_sender.send(SynthMessage::NoteOff(data1)).ok();
                     },
                     0xB0 => {
                         // Control Change
                         match data1 {
                             1 => {
                                 // Modulation wheel
-                                // Map 0-127 to 0.0-1.0
                                 let value = data2 as f32 / 127.0;
-                                sender.send(SynthMessage::SetModulation(value)).ok();
+                                message_sender.send(SynthMessage::SetModulation(value)).ok();
                             },
                             7 => {
                                 // Volume
                                 let value = data2 as f32 / 127.0;
-                                sender.send(SynthMessage::SetVolume(value)).ok();
+                                message_sender.send(SynthMessage::SetVolume(value)).ok();
                             },
                             64 => {
                                 // Sustain pedal
                                 let on = data2 >= 64;
-                                sender.send(SynthMessage::SetSustainPedal(on)).ok();
+                                message_sender.send(SynthMessage::SetSustainPedal(on)).ok();
                             },
                             // Add more CC handlers as needed
                             _ => {}
                         }
-                    },
-                    0xE0 => {
-                        // Pitch Bend
-                        // Combine the two 7-bit values into one 14-bit value
-                        let bend_value = ((data2 as u16) << 7) | (data1 as u16);
-                        // Map from 0-16383 to -1.0 to 1.0
-                        let normalized = (bend_value as f32 / 8192.0) - 1.0;
-                        sender.send(SynthMessage::SetPitchBend(normalized)).ok();
-                    },
-                    0xA0 => {
-                        // Aftertouch (Key Pressure)
-                        let note = data1;
-                        let pressure = data2 as f32 / 127.0;
-                        sender.send(SynthMessage::SetAftertouch(note, pressure)).ok();
-                    },
-                    0xD0 => {
-                        // Channel Pressure
-                        let pressure = data1 as f32 / 127.0;
-                        sender.send(SynthMessage::SetChannelPressure(pressure)).ok();
                     },
                     // Add more MIDI message handling as needed
                     _ => {}
@@ -797,41 +662,24 @@ impl SynthApp {
         }
     }
 
-    // Add a method to save a preset
     fn save_preset(&mut self, name: String) -> Result<()> {
-        let synth = self.synth.read().unwrap();
-        let preset = synth.create_preset(name.clone());
-        
-        // Check if preset with this name already exists
-        if let Some(pos) = self.presets.iter().position(|p| p.name == name) {
-            // Replace existing preset
-            self.presets[pos] = preset.clone();
-        } else {
-            // Add new preset
-            self.presets.push(preset.clone());
-        }
-        
-        // Save presets to file
-        self.save_presets_to_file()?;
-        
-        // Update current preset name
-        self.current_preset_name = name;
-        
-        // Update app settings
-        self.app_settings.last_preset = Some(self.current_preset_name.clone());
-        self.save_app_settings()?;
-        
-        Ok(())
-    }
-    
-    // Add a method to load a preset
-    fn load_preset(&mut self, name: &str) -> Result<()> {
-        if let Some(preset) = self.presets.iter().find(|p| p.name == name) {
-            let mut synth = self.synth.write().unwrap();
-            synth.apply_preset(preset);
+        if let Ok(synth) = self.synth.read() {
+            let preset = synth.create_preset(&name, "User", "Custom preset");
+            
+            // Check if preset with this name already exists
+            if let Some(pos) = self.presets.iter().position(|p| p.name == name) {
+                // Replace existing preset
+                self.presets[pos] = preset.clone();
+            } else {
+                // Add new preset
+                self.presets.push(preset);
+            }
+            
+            // Save presets to file
+            self.save_presets_to_file()?;
             
             // Update current preset name
-            self.current_preset_name = name.to_string();
+            self.current_preset_name = name;
             
             // Update app settings
             self.app_settings.last_preset = Some(self.current_preset_name.clone());
@@ -841,7 +689,23 @@ impl SynthApp {
         Ok(())
     }
     
-    // Add a method to delete a preset
+    fn load_preset(&mut self, name: &str) -> Result<()> {
+        if let Some(preset) = self.presets.iter().find(|p| p.name == name) {
+            if let Ok(mut synth) = self.synth.write() {
+                synth.apply_preset(preset);
+                
+                // Update current preset name
+                self.current_preset_name = name.to_string();
+                
+                // Update app settings
+                self.app_settings.last_preset = Some(self.current_preset_name.clone());
+                self.save_app_settings()?;
+            }
+        }
+        
+        Ok(())
+    }
+    
     fn delete_preset(&mut self, name: &str) -> Result<()> {
         if let Some(pos) = self.presets.iter().position(|p| p.name == name) {
             self.presets.remove(pos);
@@ -860,7 +724,6 @@ impl SynthApp {
         Ok(())
     }
     
-    // Add a method to save presets to file
     fn save_presets_to_file(&self) -> Result<()> {
         // Create presets directory if it doesn't exist
         let presets_dir = Self::get_presets_dir()?;
@@ -884,17 +747,7 @@ impl SynthApp {
         let path = settings_dir.join("settings.json");
         let file = File::create(path)?;
         
-        let settings = AppSettings {
-            selected_midi_port: self.midi_ports.get(self.selected_midi_port).cloned(),
-            selected_output_device: self.available_output_devices
-                .get(self.selected_output_device_idx)
-                .and_then(|d| d.name().ok()),
-            volume: self.app_settings.volume,
-            last_preset: Some(self.current_preset_name.clone()),
-            ..AppSettings::default()
-        };
-        
-        serde_json::to_writer_pretty(file, &settings)?;
+        serde_json::to_writer_pretty(file, &self.app_settings)?;
         Ok(())
     }
     
